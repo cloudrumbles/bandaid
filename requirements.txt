@@ -1,0 +1,7 @@
+# For Ubuntu/Debian systems, install with:
+# sudo apt-get install python3-opencv python3-pil
+# 
+# Or with pip (if needed):
+opencv-python>=4.6.0
+numpy>=1.21.0
+Pillow>=10.2.0
