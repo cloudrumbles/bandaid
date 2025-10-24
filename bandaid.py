@@ -178,6 +178,10 @@ def process_image(input_path, bandaid_path, output_path=None, scale=0.8):
         return
     
     # Add alpha channel if not present
+    if len(bandaid.shape) < 3:
+        print(f"Error: Band-aid image must be a color image")
+        return
+    
     if bandaid.shape[2] == 3:
         # Create alpha channel (make black pixels transparent)
         alpha = np.ones((bandaid.shape[0], bandaid.shape[1], 1), dtype=np.uint8) * 255
@@ -270,7 +274,7 @@ def main():
     if len(sys.argv) >= 3:
         output_path = Path(sys.argv[2])
     else:
-        output_path = input_path.stem + "_bandaid" + input_path.suffix
+        output_path = Path(input_path.stem + "_bandaid" + input_path.suffix)
     
     # Process the image
     process_image(input_path, bandaid_path, output_path)
