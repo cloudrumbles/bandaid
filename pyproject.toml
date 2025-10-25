@@ -5,17 +5,23 @@ description = "A Python program that automatically detects a person's arm in a p
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ddgs>=9.6.1",
     "mediapipe>=0.10.21",
     "opencv-python>=4.8.0",
     "numpy>=1.24.0",
     "pillow>=10.0.0",
     "matplotlib>=3.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
     "pytest>=8.4.2",
 ]
 
 [project.scripts]
 bandaid = "bandaid.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bandaid"]
 
 [build-system]
 requires = ["hatchling"]
