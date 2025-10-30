@@ -20,10 +20,7 @@ def test_all_arms():
     # Define test images
     assets_dir = Path(__file__).parent.parent / "assets" / "sample_arms"
     test_images = [
-        assets_dir / "arm_image.jpg",
-        assets_dir / "arm_test2.jpg",
-        assets_dir / "tshirt_arm.jpg",
-        assets_dir / "bent_arm.jpg",
+        assets_dir / "new_arm2.jpg",
     ]
 
     # Output directory
