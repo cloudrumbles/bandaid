@@ -8,7 +8,15 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 from pathlib import Path
-from skin_segmenter import SkinSegmenter
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+# Try relative import first, fall back to absolute
+try:
+    from .skin_segmenter import SkinSegmenter
+except ImportError:
+    from skin_segmenter import SkinSegmenter
 
 
 def find_largest_contiguous_block(binary_mask):
@@ -72,9 +80,74 @@ def get_limb_orientation(contour):
     return angle, center, major_axis_vec, minor_axis_vec
 
 
-def find_widest_breadth_point(mask, contour, major_axis_vec, minor_axis_vec, center):
+def detect_hand_wrist(image_array, mask):
     """
-    Find the point along the limb where the breadth (width perpendicular to length) is widest.
+    Detect wrist landmark using MediaPipe Hand Landmarker.
+
+    Args:
+        image_array: Original image as RGB numpy array
+        mask: Binary mask of the arm region
+
+    Returns:
+        wrist_point: (x, y) coordinates of wrist, or None if not detected
+    """
+    try:
+        # Download hand landmarker model if needed
+        model_path = "hand_landmarker.task"
+        if not Path(model_path).exists():
+            print("Downloading hand landmarker model...")
+            import urllib.request
+            model_url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+            urllib.request.urlretrieve(model_url, model_path)
+            print("Hand landmarker model downloaded.")
+
+        # Initialize hand landmarker
+        BaseOptions = mp.tasks.BaseOptions
+        HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
+
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=VisionRunningMode.IMAGE,
+            num_hands=2
+        )
+
+        with vision.HandLandmarker.create_from_options(options) as landmarker:
+            # Convert to MediaPipe Image
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=image_array
+            )
+
+            # Detect hands
+            detection_result = landmarker.detect(mp_image)
+
+            if detection_result.hand_landmarks:
+                # Check each detected hand to see if wrist is within the mask
+                for hand_landmarks in detection_result.hand_landmarks:
+                    # Wrist is landmark 0
+                    wrist = hand_landmarks[0]
+                    wrist_x = int(wrist.x * image_array.shape[1])
+                    wrist_y = int(wrist.y * image_array.shape[0])
+
+                    # Check if wrist is within the mask
+                    if (0 <= wrist_x < mask.shape[1] and
+                        0 <= wrist_y < mask.shape[0] and
+                        mask[wrist_y, wrist_x] > 0):
+                        print(f"Wrist detected at: ({wrist_x}, {wrist_y})")
+                        return (wrist_x, wrist_y)
+
+        print("No wrist detected within arm region")
+        return None
+
+    except Exception as e:
+        print(f"Hand detection failed: {e}")
+        return None
+
+
+def find_q1_breadth_point(mask, contour, major_axis_vec, minor_axis_vec, center, wrist_point=None):
+    """
+    Sample 200 positions along the arm and find the point where breadth is closest to Q1.
 
     Args:
         mask: Binary mask of the limb
@@ -82,17 +155,17 @@ def find_widest_breadth_point(mask, contour, major_axis_vec, minor_axis_vec, cen
         major_axis_vec: Unit vector along the major axis (length)
         minor_axis_vec: Unit vector along the minor axis (breadth)
         center: Center point of the limb
+        wrist_point: (x, y) coordinates of wrist if detected, or None
 
     Returns:
-        widest_point: (x, y) coordinates of the center of the widest section
-        widest_breadth: The width value at the widest point
+        q1_point: (x, y) coordinates of the center at Q1 breadth position
+        q1_breadth: The breadth value at Q1 position
         breadth_angle: Angle of the breadth direction in degrees
     """
     # Get bounding rectangle
     x, y, w, h = cv2.boundingRect(contour)
 
     # Determine scan range along major axis
-    # We'll scan from -half_length to +half_length along the major axis
     points = contour.reshape(-1, 2)
 
     # Project all points onto major axis to find extent
@@ -100,46 +173,110 @@ def find_widest_breadth_point(mask, contour, major_axis_vec, minor_axis_vec, cen
     projections = np.dot(points - center_np, major_axis_vec)
     min_proj, max_proj = projections.min(), projections.max()
 
-    # Sample points along the major axis
-    num_samples = 100
+    # Determine hand region if wrist is detected
+    hand_region_start = None
+    hand_region_end = None
+    if wrist_point is not None:
+        wrist_np = np.array(wrist_point)
+        wrist_proj = np.dot(wrist_np - center_np, major_axis_vec)
+
+        # Project wrist onto major axis to determine hand direction
+        # Find the arm extent in both directions from wrist
+        dist_to_min = abs(wrist_proj - min_proj)
+        dist_to_max = abs(wrist_proj - max_proj)
+
+        # Hand is on the side with shorter distance
+        if dist_to_min < dist_to_max:
+            hand_region_start = min_proj
+            hand_region_end = wrist_proj
+            print(f"Hand region identified: from projection {min_proj:.1f} to {wrist_proj:.1f}")
+        else:
+            hand_region_start = wrist_proj
+            hand_region_end = max_proj
+            print(f"Hand region identified: from projection {wrist_proj:.1f} to {max_proj:.1f}")
+
+    # Sample 200 points along the major axis
+    num_samples = 200
     scan_positions = np.linspace(min_proj, max_proj, num_samples)
 
-    max_breadth = 0
-    widest_point = center
+    breadth_measurements = []
+    position_data = []
 
     for proj in scan_positions:
+        # Skip if in hand region
+        if hand_region_start is not None:
+            if min(hand_region_start, hand_region_end) <= proj <= max(hand_region_start, hand_region_end):
+                continue
+
         # Position along major axis
         scan_center = center_np + proj * major_axis_vec
 
         # Measure breadth perpendicular to major axis at this position
-        # Cast rays in both directions along minor axis
-        breadth = 0
+        # Count pixels in both directions along minor axis until edge of mask
+        breadth_positive = 0
+        breadth_negative = 0
 
-        # Check multiple ray lengths to find the actual breadth
+        # Measure positive direction
         for ray_len in range(1, max(w, h)):
             pos_point = (scan_center + ray_len * minor_axis_vec).astype(int)
-            neg_point = (scan_center - ray_len * minor_axis_vec).astype(int)
-
-            # Check if points are within bounds
             if (0 <= pos_point[0] < mask.shape[1] and 0 <= pos_point[1] < mask.shape[0] and
-                0 <= neg_point[0] < mask.shape[1] and 0 <= neg_point[1] < mask.shape[0]):
-
-                # If both points are in the mask, breadth continues
-                if mask[pos_point[1], pos_point[0]] > 0 and mask[neg_point[1], neg_point[0]] > 0:
-                    breadth = ray_len * 2
-                else:
-                    break
+                mask[pos_point[1], pos_point[0]] > 0):
+                breadth_positive = ray_len
             else:
                 break
 
-        if breadth > max_breadth:
-            max_breadth = breadth
-            widest_point = tuple(scan_center.astype(int))
+        # Measure negative direction
+        for ray_len in range(1, max(w, h)):
+            neg_point = (scan_center - ray_len * minor_axis_vec).astype(int)
+            if (0 <= neg_point[0] < mask.shape[1] and 0 <= neg_point[1] < mask.shape[0] and
+                mask[neg_point[1], neg_point[0]] > 0):
+                breadth_negative = ray_len
+            else:
+                break
+
+        total_breadth = breadth_positive + breadth_negative
+
+        if total_breadth > 0:  # Only include non-zero breadth measurements
+            # Calculate the actual center of the width at this position
+            # If breadth is asymmetric, adjust the center point
+            offset = (breadth_positive - breadth_negative) / 2.0
+            actual_center = scan_center + offset * minor_axis_vec
+
+            breadth_measurements.append(total_breadth)
+            position_data.append({
+                'projection': proj,
+                'center': tuple(actual_center.astype(int)),
+                'breadth': total_breadth
+            })
+
+    if not breadth_measurements:
+        print("No valid breadth measurements found!")
+        return center, 0, 0
+
+    # Calculate Q1 (first quartile) of breadth measurements
+    q1_breadth = np.percentile(breadth_measurements, 25)
+    print(f"Breadth statistics: min={min(breadth_measurements):.1f}, "
+          f"Q1={q1_breadth:.1f}, median={np.median(breadth_measurements):.1f}, "
+          f"max={max(breadth_measurements):.1f}")
+
+    # Find position with breadth closest to Q1
+    min_diff = float('inf')
+    q1_position = None
+    q1_breadth_actual = 0
+
+    for pos_data in position_data:
+        diff = abs(pos_data['breadth'] - q1_breadth)
+        if diff < min_diff:
+            min_diff = diff
+            q1_position = pos_data['center']
+            q1_breadth_actual = pos_data['breadth']
 
     # Calculate the angle of the breadth direction (perpendicular to major axis)
     breadth_angle = np.arctan2(minor_axis_vec[1], minor_axis_vec[0]) * 180 / np.pi
 
-    return widest_point, max_breadth, breadth_angle
+    print(f"Selected Q1 position with breadth {q1_breadth_actual:.1f}px (target Q1: {q1_breadth:.1f}px)")
+
+    return q1_position, q1_breadth_actual, breadth_angle
 
 
 def place_bandaid(base_image, bandaid_image, position, angle, scale_factor=1.0):
@@ -195,7 +332,7 @@ def place_bandaid(base_image, bandaid_image, position, angle, scale_factor=1.0):
     return np.array(result_image)
 
 
-def process_image_with_bandaid(image_path, bandaid_path, output_dir=None, debug=False, bandaid_scale=None):
+def process_image_with_bandaid(image_path, output_dir=None, debug=False, bandaid_scale=None, bandaid_path="bandaid.png"):
     """
     Complete pipeline: segment skin, find widest point, place bandaid.
 
@@ -247,60 +384,31 @@ def process_image_with_bandaid(image_path, bandaid_path, output_dir=None, debug=
     print(f"Major axis angle: {angle:.2f}°")
     print(f"Center point: {center}")
 
-    # Find widest breadth point
-    print("Finding widest breadth point...")
-    widest_point, max_breadth, breadth_angle = find_widest_breadth_point(
-        largest_mask, contour, major_axis_vec, minor_axis_vec, center
+    # Detect hand/wrist
+    print("Detecting hand/wrist...")
+    wrist_point = detect_hand_wrist(image_array, largest_mask)
+
+    # Find Q1 breadth point
+    print("Finding Q1 breadth point...")
+    q1_point, q1_breadth, breadth_angle = find_q1_breadth_point(
+        largest_mask, contour, major_axis_vec, minor_axis_vec, center, wrist_point
     )
-    print(f"Widest point: {widest_point}")
-    print(f"Max breadth: {max_breadth} pixels")
+    print(f"Q1 point: {q1_point}")
+    print(f"Q1 breadth: {q1_breadth} pixels")
     print(f"Breadth angle: {breadth_angle:.2f}°")
 
-    # Calculate appropriate bandaid scale based on breadth with padding
+    # Calculate appropriate bandaid scale based on breadth
     bandaid_img = Image.open(bandaid_path)
 
     if bandaid_scale is not None:
         scale_factor = bandaid_scale
         print(f"Using manual bandaid scale factor: {scale_factor:.3f}")
     else:
-        # Auto-calculate with padding constraint
-        # The bandaid's length (width) extends along the breadth direction
-        # We want: bandaid_length/2 (half extends from center) + bandaid_length/3 (padding)
-        # This means: 0.5L + 0.333L = 0.833L should fit within the mask extent
-        # So: 0.833L <= extent from center in one direction
-        # Therefore: L <= extent / 0.833
-
-        # Measure actual mask extent from widest point in both directions along breadth
-        extent_positive = 0
-        extent_negative = 0
-
-        for ray_len in range(1, max(largest_mask.shape)):
-            pos_point = (int(widest_point[0] + ray_len * minor_axis_vec[0]),
-                        int(widest_point[1] + ray_len * minor_axis_vec[1]))
-            neg_point = (int(widest_point[0] - ray_len * minor_axis_vec[0]),
-                        int(widest_point[1] - ray_len * minor_axis_vec[1]))
-
-            # Check positive direction
-            if (0 <= pos_point[0] < largest_mask.shape[1] and
-                0 <= pos_point[1] < largest_mask.shape[0] and
-                largest_mask[pos_point[1], pos_point[0]] > 0):
-                extent_positive = ray_len
-
-            # Check negative direction
-            if (0 <= neg_point[0] < largest_mask.shape[1] and
-                0 <= neg_point[1] < largest_mask.shape[0] and
-                largest_mask[neg_point[1], neg_point[0]] > 0):
-                extent_negative = ray_len
-
-        min_extent = min(extent_positive, extent_negative)
-        print(f"Mask extent from widest point: +{extent_positive}px, -{extent_negative}px (using {min_extent}px)")
-
-        # Calculate max bandaid length that allows 1/3 padding
-        # min_extent = 0.5L + 0.333L = 0.833L
-        max_bandaid_length = min_extent / 0.833
-
-        scale_factor = max_bandaid_length / bandaid_img.width
-        print(f"Auto-calculated bandaid scale factor: {scale_factor:.3f} (with 1/3 length padding)")
+        # Scale bandaid length to 80% of breadth at Q1 position
+        # The bandaid's length (width) should be 80% of the arm breadth
+        target_bandaid_length = q1_breadth * 0.8
+        scale_factor = target_bandaid_length / bandaid_img.width
+        print(f"Auto-calculated bandaid scale factor: {scale_factor:.3f} (80% of breadth: {target_bandaid_length:.1f}px)")
 
     print(f"Bandaid original size: {bandaid_img.width}x{bandaid_img.height}")
     print(f"Bandaid scaled size: {int(bandaid_img.width * scale_factor)}x{int(bandaid_img.height * scale_factor)}")
@@ -313,7 +421,7 @@ def process_image_with_bandaid(image_path, bandaid_path, output_dir=None, debug=
     result_image = place_bandaid(
         image_array,
         bandaid_path,
-        widest_point,
+        q1_point,
         -breadth_angle,  # Negate for proper PIL rotation direction
         scale_factor
     )
@@ -325,8 +433,9 @@ def process_image_with_bandaid(image_path, bandaid_path, output_dir=None, debug=
         'largest_block_pixels': int(largest_pixels),
         'center': center,
         'major_axis_angle': float(angle),
-        'widest_point': widest_point,
-        'max_breadth': float(max_breadth),
+        'wrist_point': wrist_point,
+        'q1_point': q1_point,
+        'q1_breadth': float(q1_breadth),
         'breadth_angle': float(breadth_angle),
         'scale_factor': float(scale_factor)
     }
@@ -372,20 +481,25 @@ def process_image_with_bandaid(image_path, bandaid_path, output_dir=None, debug=
         axes[1, 0].set_title(f"Orientation\nRed=Length, Blue=Breadth")
         axes[1, 0].axis('off')
 
-        # Widest point visualization
-        vis_widest = image_array.copy()
-        cv2.circle(vis_widest, widest_point, 10, (0, 255, 0), -1)
+        # Q1 point visualization
+        vis_q1 = image_array.copy()
+        cv2.circle(vis_q1, q1_point, 10, (0, 255, 0), -1)
 
-        # Draw line across the widest breadth
-        line_len = int(max_breadth / 2) + 20
-        line_end1 = (int(widest_point[0] + minor_axis_vec[0] * line_len),
-                     int(widest_point[1] + minor_axis_vec[1] * line_len))
-        line_end2 = (int(widest_point[0] - minor_axis_vec[0] * line_len),
-                     int(widest_point[1] - minor_axis_vec[1] * line_len))
-        cv2.line(vis_widest, line_end1, line_end2, (255, 255, 0), 3)
+        # Draw wrist if detected
+        if wrist_point:
+            cv2.circle(vis_q1, wrist_point, 8, (255, 0, 255), -1)
 
-        axes[1, 1].imshow(vis_widest)
-        axes[1, 1].set_title(f"Widest Point\nBreadth={max_breadth:.0f}px")
+        # Draw line across the Q1 breadth (exactly the measured breadth)
+        line_len = int(q1_breadth / 2)
+        line_end1 = (int(q1_point[0] + minor_axis_vec[0] * line_len),
+                     int(q1_point[1] + minor_axis_vec[1] * line_len))
+        line_end2 = (int(q1_point[0] - minor_axis_vec[0] * line_len),
+                     int(q1_point[1] - minor_axis_vec[1] * line_len))
+        cv2.line(vis_q1, line_end1, line_end2, (255, 255, 0), 3)
+
+        axes[1, 1].imshow(vis_q1)
+        wrist_text = " (Wrist detected)" if wrist_point else ""
+        axes[1, 1].set_title(f"Q1 Breadth Point{wrist_text}\nBreadth={q1_breadth:.0f}px")
         axes[1, 1].axis('off')
 
         # Final result
@@ -408,24 +522,58 @@ def process_image_with_bandaid(image_path, bandaid_path, output_dir=None, debug=
         result_img.save(result_path)
         print(f"Result saved to: {result_path}")
 
+    # Generate comparison visualization
+    if output_dir:
+        print("Generating comparison visualization...")
+        comparison_path = output_path / 'comparison.png'
+        create_comparison_visualization(image_array, result_image, comparison_path)
+        print(f"Comparison saved to: {comparison_path}")
+
     return result_image, info
+
+
+def create_comparison_visualization(original_image, result_image, save_path):
+    """
+    Create a side-by-side comparison visualization of original and result images.
+
+    Args:
+        original_image: Original image as numpy array (RGB)
+        result_image: Result image with bandaid as numpy array (RGB)
+        save_path: Path to save the comparison image
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+
+    # Original image
+    axes[0].imshow(original_image)
+    axes[0].set_title("Original Image", fontsize=16, fontweight='bold')
+    axes[0].axis('off')
+
+    # Result image
+    axes[1].imshow(result_image)
+    axes[1].set_title("With Bandaid", fontsize=16, fontweight='bold')
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return save_path
 
 
 def main():
     """Main entry point."""
-    if len(sys.argv) < 3:
-        print("Usage: python bandaid_placer.py <image_path> <bandaid_path> [output_dir] [scale_factor]")
+    if len(sys.argv) < 2:
+        print("Usage: python bandaid_placer.py <image_path> [output_dir] [scale_factor]")
+        print("  output_dir: Optional output directory (default: bandaid_output)")
         print("  scale_factor: Optional manual scale (e.g., 0.5, 1.0, 2.0). If not provided, auto-calculates.")
         sys.exit(1)
 
     image_path = sys.argv[1]
-    bandaid_path = sys.argv[2]
-    output_dir = sys.argv[3] if len(sys.argv) > 3 else "bandaid_output"
-    bandaid_scale = float(sys.argv[4]) if len(sys.argv) > 4 else None
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else "bandaid_output"
+    bandaid_scale = float(sys.argv[3]) if len(sys.argv) > 3 else None
 
     result, info = process_image_with_bandaid(
         image_path,
-        bandaid_path,
         output_dir=output_dir,
         debug=True,
         bandaid_scale=bandaid_scale
